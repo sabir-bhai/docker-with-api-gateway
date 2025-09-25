@@ -1,0 +1,59 @@
+# apps/user-service/Dockerfile
+# Multi-stage build for Nx monorepo: build at repo root, then create small runtime image
+
+######## builder ########
+FROM node:18-alpine AS builder
+RUN apk add --no-cache bash curl build-base
+
+WORKDIR /apps
+
+# 0) Copy root-level files so workspace install works
+COPY package.json package-lock.json* ./
+# copy tsconfig base to the path the app expects (extends "../../tsconfig.base.json")
+COPY tsconfig.base.json /apps/tsconfig.base.json
+
+# 1) Copy service package so npm knows the workspace package exists
+COPY apps/user-service/package*.json ./apps/user-service/
+
+# 2) Install dependencies at repo root (includes devDeps: typescript, @types/*)
+# Prefer npm ci if lockfile exists
+RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi
+
+# 3) Copy service source & tsconfigs (do this AFTER npm ci for better caching)
+COPY apps/user-service/tsconfig.app.json ./apps/user-service/tsconfig.app.json
+COPY apps/user-service/tsconfig.json     ./apps/user-service/tsconfig.json
+COPY apps/user-service/src               ./apps/user-service/src
+# (optional) copy any other files the build expects (e.g. src/assets) if present
+
+# 4) Build inside the service folder
+WORKDIR /apps/apps/user-service
+# Print package.json scripts for sanity
+RUN echo "=== package.json (service) ===" && cat package.json || true
+# Run the build
+RUN npm run build
+
+# 5) Verify dist was created (fail early if not)
+RUN echo "=== dist listing ===" && ls -la ./dist || (echo "dist missing!" && exit 1)
+
+######## runtime ########
+FROM node:18-alpine AS runtime
+RUN apk add --no-cache curl
+
+WORKDIR /apps/user-service
+
+# Copy only runtime artifacts and package.json
+COPY --from=builder /apps/apps/user-service/dist ./dist
+COPY --from=builder /apps/apps/user-service/package*.json ./
+
+# Install production deps in runtime (creates node_modules here)
+# Use package-lock.json if present
+RUN if [ -f package-lock.json ]; then npm ci --only=production; else npm install --omit=dev --no-audit --no-fund; fi
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs \
+ && adduser -S nodejs -u 1001 -G nodejs \
+ && chown -R nodejs:nodejs /apps
+USER nodejs
+
+EXPOSE 3000
+CMD ["npm", "start"]
