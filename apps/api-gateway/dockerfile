@@ -1,0 +1,59 @@
+# apps/api-gateway/Dockerfile
+# ---------- builder ----------
+FROM node:18-alpine AS builder
+RUN apk add --no-cache curl
+
+# base path inside image
+WORKDIR /apps
+
+# copy package json for layer caching
+COPY apps/api-gateway/package*.json ./api-gateway/
+
+# explicitly copy service tsconfigs so tsc -p finds them
+COPY apps/api-gateway/tsconfig.app.json ./api-gateway/tsconfig.app.json
+COPY apps/api-gateway/tsconfig.json ./api-gateway/tsconfig.json
+
+# copy repo-level tsconfig base where tsc expects it (you had error complaining about /tsconfig.base.json)
+# if your repo DOES NOT have tsconfig.base.json, this line is safe to keep if file exists; otherwise remove.
+COPY tsconfig.base.json /tsconfig.base.json
+
+# copy service source (required for TS inputs)
+COPY apps/api-gateway/src ./api-gateway/src
+
+# install deps (dev deps needed to build)
+WORKDIR /apps/api-gateway
+RUN npm install
+
+# DEBUG: verify files exist (remove these two RUN lines when build works)
+RUN echo "=== /tsconfig.base.json ===" && ls -la /tsconfig.base.json || true
+RUN echo "=== /apps/api-gateway ===" && ls -la /apps/api-gateway || true
+
+# build TypeScript
+RUN npm run build
+
+# create production-only node_modules
+RUN npm ci --production --ignore-scripts --no-audit --no-fund || true
+
+# ---------- runtime ----------
+FROM node:18-alpine AS runtime
+RUN apk add --no-cache curl
+
+WORKDIR /apps/api-gateway
+
+# copy runtime artifacts from builder
+COPY --from=builder /apps/api-gateway/package*.json ./
+COPY --from=builder /apps/api-gateway/dist ./dist
+COPY --from=builder /apps/api-gateway/node_modules ./node_modules
+
+# create non-root user and set ownership
+RUN addgroup -g 1001 -S nodejs \
+ && adduser -S nodejs -u 1001 -G nodejs \
+ && chown -R nodejs:nodejs /apps
+USER nodejs
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:3000/health || curl -f http://localhost:3000/ || exit 1
+
+CMD ["npm", "start"]
